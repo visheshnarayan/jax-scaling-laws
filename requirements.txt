@@ -1,0 +1,7 @@
+datasets
+tiktoken
+jax
+flax
+optax
+numpy
+scipy
