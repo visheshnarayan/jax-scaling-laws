@@ -7,7 +7,7 @@ from pathlib import Path
 from model.transformer import Transformer, TransformerConfig
 from model.init import count_params
 from data.loader import load_shard, get_batch
-from train.train_step import train_step, eval_step
+from train.train_step import make_train_step, make_eval_step
 
 
 def create_optimizer(config: TransformerConfig, total_steps: int): 
@@ -49,25 +49,29 @@ def train(config: TransformerConfig, token_budget: int, batch_size: int=64, eval
     train_tokens = load_shard("train")
     val_tokens = load_shard("val")
 
-    # training loop 
+    # create jitted step functions (closed over model and optimizer)
+    train_step = make_train_step(model, tx)
+    eval_step = make_eval_step(model)
+
+    # training loop
     n_params = count_params(config)
     print(f"Training {n_params:,} param model for {total_steps:,} steps ({token_budget:,} tokens)")
 
-    log = [] 
+    log = []
     for step in range(total_steps):
-        # get batch 
+        # get batch
         x, y = get_batch(train_tokens, batch_size, rng, config.block_size)
         x, y = jnp.array(x), jnp.array(y)
 
-        # train steps 
-        params, opt_state, loss = train_step(params, x, y, opt_state, model, tx)
+        # train step
+        params, opt_state, loss = train_step(params, x, y, opt_state)
 
         tokens_seen = (step + 1) * tokens_per_step
 
-        if step%eval_every==0 or step == total_steps - 1: 
+        if step%eval_every==0 or step == total_steps - 1:
             vx, vy = get_batch(val_tokens, batch_size, rng, config.block_size)
             vx, vy = jnp.array(vx), jnp.array(vy)
-            val_loss = eval_step(params, vx, vy, model) 
+            val_loss = eval_step(params, vx, vy)
 
             print(f"    step {step:>6d} | train_loss {loss:.4f} | val_loss {val_loss:.4f} | tokens {tokens_seen:,}")
             log.append({"step":step, "tokens_seen":tokens_seen, "train_loss": float(loss), "val_loss": float(val_loss)})
