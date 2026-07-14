@@ -16,7 +16,7 @@ VAL_FRACTION = 0.05  # 5% held out for validation
 
 
 def download_dataset():
-    """Download WikiText-103 from HuggingFace (small, no auth, instant)."""
+    """Download WikiText-103 from HuggingFace."""
     ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
     # Filter out empty lines
     ds = ds.filter(lambda x: len(x["text"].strip()) > 0)
