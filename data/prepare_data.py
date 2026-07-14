@@ -3,35 +3,35 @@ Data preparation pipeline for scaling-laws project.
 Downloads WikiText-103, tokenizes with GPT-2 BPE,
 and stores as flat numpy arrays for fast random-access during training.
 """
-import io
-import zipfile
-import urllib.request
+import os
 from pathlib import Path
 
+from datasets import load_dataset
 import tiktoken
 import numpy as np
 
+# Disable HuggingFace Xet backend (causes stalled downloads)
+os.environ["HF_HUB_ENABLE_XET"] = "0"
 
 CACHE_DIR = Path(__file__).resolve().parent.parent / "cache"
 BLOCK_LENGTH = 1024
 VAL_FRACTION = 0.05
 
 
-def download_raw_text() -> str:
-    """Download WikiText-103 raw text directly (no HuggingFace)."""
-    url = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-103-raw-v1.zip"
-    print(f"Downloading from {url} ...")
-    data, _ = urllib.request.urlretrieve(url)
-    with zipfile.ZipFile(data) as zf:
-        with zf.open("wikitext-103-raw/wiki.train.raw") as f:
-            text = f.read().decode("utf-8")
-    return text
+def download_dataset():
+    """Download WikiText-103 from HuggingFace."""
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
+    ds = ds.filter(lambda x: len(x["text"].strip()) > 0)
+    return ds
 
 
-def tokenize_text(text: str, enc) -> np.ndarray:
-    """Tokenize raw text into one flat token array."""
-    tokens = enc.encode(text)
-    return np.array(tokens, dtype=np.uint16)
+def tokenize_and_concatenate(ds, enc) -> np.ndarray:
+    """Tokenize all documents and concatenate into one flat token array."""
+    all_tokens = []
+    for row in ds:
+        tokens = enc.encode(row["text"])
+        all_tokens.extend(tokens)
+    return np.array(all_tokens, dtype=np.uint16)
 
 
 def prepare():
@@ -41,10 +41,10 @@ def prepare():
     enc = tiktoken.get_encoding("gpt2")
 
     print("Downloading dataset...")
-    text = download_raw_text()
+    ds = download_dataset()
 
-    print("Tokenizing...")
-    tokens = tokenize_text(text, enc)
+    print(f"Tokenizing {len(ds)} documents...")
+    tokens = tokenize_and_concatenate(ds, enc)
 
     # Truncate to a multiple of block length (discard partial trailing block)
     n_tokens = (len(tokens) // BLOCK_LENGTH) * BLOCK_LENGTH
