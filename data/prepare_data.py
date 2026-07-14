@@ -15,11 +15,10 @@ BLOCK_LENGTH = 1024
 VAL_FRACTION = 0.05  # 5% held out for validation
 
 
-def download_dataset():
-    """Download WikiText-103 from HuggingFace."""
-    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split="train")
-    # Filter out empty lines
-    ds = ds.filter(lambda x: len(x["text"].strip()) > 0)
+def download_dataset(num_samples: int = 500_000):
+    """Download OpenWebText subset from HuggingFace."""
+    ds = load_dataset("Skylion007/openwebtext", split="train")
+    ds = ds.select(range(min(num_samples, len(ds))))
     return ds
 
 
@@ -33,14 +32,14 @@ def tokenize_and_concatenate(ds, enc) -> np.ndarray:
     return np.array(all_tokens, dtype=np.uint16)
 
 
-def prepare():
+def prepare(num_samples: int = 500_000):
     """Main pipeline to download, tokenize, split, save data"""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     enc = tiktoken.get_encoding("gpt2")
 
     print("Downloading dataset...")
-    ds = download_dataset()
+    ds = download_dataset(num_samples)
 
     print(f"Tokenizing {len(ds)} documents...")
     tokens = tokenize_and_concatenate(ds, enc)
