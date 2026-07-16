@@ -62,7 +62,6 @@ class TransformerBlock(nn.Module):
     config: TransformerConfig
 
     @nn.compact
-    @nn.remat  # gradient checkpointing: recompute activations during backward instead of storing
     def __call__(self, x, deterministic=True):
         # pre ln architecture
         x = x + CasualSelfAttention(self.config)(nn.LayerNorm()(x), deterministic)
@@ -82,9 +81,10 @@ class Transformer(nn.Module):
         pos_emb = nn.Embed(cfg.block_size, cfg.d_model)(jnp.arange(T))
         x = tok_emb + pos_emb
 
-        # transformer blocks 
+        # transformer blocks (remat: recompute activations during backward to save memory)
+        RematBlock = nn.remat(TransformerBlock)
         for _ in range(cfg.n_layers):
-            x = TransformerBlock(cfg)(x, deterministic)
+            x = RematBlock(cfg)(x, deterministic)
 
         # final layer norm + project to vocab
         x = nn.LayerNorm()(x)
