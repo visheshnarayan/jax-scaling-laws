@@ -1,6 +1,8 @@
 cache/
 results/*
 !results/plots/
+!results/scaling_law_coeffs.json
+!results/sweep_results.json
 __pycache__/
 *.pyc
 .venv/
