@@ -98,7 +98,23 @@ The project uses JAX end-to-end with no PyTorch dependencies:
 
 ### Compute Optimization
 
-The 8-model sweep runs comfortably on a single GPU, but the held-out 150M verification run at ~3B tokens presents a compute bottleneck. We address this with two complementary strategies: multi-GPU data parallelism and bfloat16 mixed precision.
+The 8-model sweep runs comfortably on a single GPU, but the held-out 150M verification run at ~3B tokens presents a compute bottleneck. We address this with three complementary strategies: activation rematerialization, multi-GPU data parallelism, and bfloat16 mixed precision.
+
+**Activation rematerialization (gradient checkpointing).** The dominant memory cost during training is not the model parameters but the intermediate activations stored for the backward pass. A 150M-param transformer with 12 layers at batch 128 stores attention matrices of shape `(batch, heads, 1024, 1024)` per layer, totaling hundreds of gigabytes across all layers simultaneously. We apply Flax's `nn.remat` to each transformer block, which discards intermediate activations during the forward pass and recomputes them on-the-fly during backpropagation:
+
+```python
+RematBlock = nn.remat(TransformerBlock)
+for _ in range(cfg.n_layers):
+    x = RematBlock(cfg)(x, deterministic)
+```
+
+This trades ~30% additional compute for a ~10x reduction in activation memory: instead of storing all 12 layers' activations simultaneously, only one layer's worth exists in memory at any time. This is what enables batch 128/device on 32GB GPUs, which would be impossible otherwise.
+
+| Component | Without remat | With remat |
+|---|---|---|
+| Stored activations (batch 128) | 128 x 300MB x 12 layers = ~450GB | 128 x 50MB x 1 layer = ~6.4GB |
+| Block inputs for recompute | N/A | 128 x 19MB = ~2.4GB |
+| Compute overhead | Baseline | ~30% more FLOPs |
 
 **Automatic multi-device detection.** The training step auto-detects available devices at launch. With a single GPU it compiles via `@jax.jit` as normal. With multiple GPUs it switches to `@jax.pmap`, replicating model parameters on each device, sharding the batch, and synchronizing gradients via `lax.pmean`:
 
@@ -125,16 +141,16 @@ Batch size scales automatically with device count (e.g. 64 per device x 2 GPUs =
 
 **Why data parallelism over FSDP/tensor parallelism.** The 150M model fits comfortably in a single GPU's memory, so there is no need to shard the model itself. FSDP (sharding parameters across devices) and tensor parallelism (splitting individual layers across devices) solve a different problem: fitting models too large for one device's memory. At 150M parameters that constraint does not apply, and the communication overhead of sharding params would hurt more than it helps.
 
-**Estimated training time for the 150M verification run (bf16, ~3B tokens):**
+**Estimated training time for the 150M verification run (bf16 + remat, ~3B tokens):**
 
-| Setup | Batch Size | Steps | Time |
-|---|---|---|---|
-| 1x T4 (Kaggle/Colab) | 32 | ~91K | ~2-3 hrs |
-| 2x T4 (Kaggle) | 64 | ~46K | ~1-1.5 hrs |
-| 1x 3090 (Vast.ai) | 128 | ~23K | ~30 min |
-| 2x 5090 (RunPod) | 256 | ~11.5K | ~8-10 min |
+| Setup | Batch/device | Total batch | Steps | Time |
+|---|---|---|---|---|
+| 1x T4 (Kaggle/Colab) | 16 | 16 | ~199K | ~6-8 hrs |
+| 2x T4 (Kaggle) | 16 | 32 | ~99K | ~3-4 hrs |
+| 2x 3090 (Vast.ai) | 64 | 128 | ~24K | ~30-45 min |
+| 2x 5090 (RunPod) | 128 | 256 | ~12K | ~10-20 min |
 
-We use 2x RTX 5090 on RunPod ($0.99/hr per GPU) for the held-out verification run. Total cost for the full 150M training: under $0.50.
+We use 2x RTX 5090 on RunPod ($0.99/hr per GPU) for the held-out verification run. Activation rematerialization enables batch 128/device on 32GB cards, keeping total training time under 20 minutes.
 
 ### Fault Tolerance
 
