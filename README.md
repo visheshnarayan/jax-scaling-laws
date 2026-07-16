@@ -148,7 +148,7 @@ Batch size scales automatically with device count (e.g. 64 per device x 2 GPUs =
 | 1x T4 (Kaggle/Colab) | 16 | 16 | ~199K | ~6-8 hrs |
 | 2x T4 (Kaggle) | 16 | 32 | ~99K | ~3-4 hrs |
 | 2x 3090 (Vast.ai) | 64 | 128 | ~24K | ~30-45 min |
-| 2x 5090 (RunPod) | 128 | 256 | ~12K | ~10-20 min |
+| 2x 5090 (RunPod) | 32 | 64 | ~49K | ~3-5 hrs |
 
 We use 2x RTX 5090 on RunPod ($0.99/hr per GPU) for the held-out verification run.
 
