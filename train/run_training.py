@@ -57,10 +57,28 @@ def load_checkpoint(model_name):
     return state
 
 
+def _replicate(tree):
+    """Replicate a pytree across all local devices (for pmap)."""
+    return jax.tree.map(lambda x: jnp.broadcast_to(x, (jax.local_device_count(),) + x.shape), tree)
+
+
+def _unreplicate(tree):
+    """Extract single copy from a replicated pytree."""
+    return jax.tree.map(lambda x: x[0], tree)
+
+
 def train(config: TransformerConfig, token_budget: int, batch_size: int = 64,
           eval_every: int = 100, checkpoint_every: int = 500,
-          seed: int = 42, model_name: str = "model"):
-    """Train a single model with checkpointing and resume support."""
+          seed: int = 42, model_name: str = "model", use_bf16: bool = False):
+    """Train a single model with checkpointing, resume, and auto multi-GPU support."""
+    n_devices = jax.local_device_count()
+    multi_device = n_devices > 1
+
+    if multi_device:
+        # scale batch size by device count for higher throughput
+        batch_size = max(batch_size, 32) * n_devices
+        print(f"Multi-GPU: {n_devices} devices detected, effective batch size = {batch_size}")
+
     model = Transformer(config)
 
     tokens_per_step = batch_size * config.block_size
@@ -86,11 +104,21 @@ def train(config: TransformerConfig, token_budget: int, batch_size: int = 64,
         opt_state = tx.init(params)
         log = []
 
+    # cast params to bfloat16 for faster compute
+    if use_bf16:
+        params = jax.tree.map(lambda x: x.astype(jnp.bfloat16) if x.dtype == jnp.float32 else x, params)
+        print("Using bfloat16 mixed precision")
+
     train_tokens = load_shard("train")
     val_tokens = load_shard("val")
 
     train_step = make_train_step(model, tx)
     eval_step = make_eval_step(model)
+
+    # replicate params and optimizer state across devices for pmap
+    if multi_device:
+        params = _replicate(params)
+        opt_state = _replicate(opt_state)
 
     n_params = count_params(config)
     print(f"Training {n_params:,} param model for {total_steps:,} steps ({token_budget:,} tokens)")
@@ -101,6 +129,11 @@ def train(config: TransformerConfig, token_budget: int, batch_size: int = 64,
         x, y = get_batch(train_tokens, batch_size, rng, config.block_size)
         x, y = jnp.array(x), jnp.array(y)
 
+        if multi_device:
+            # reshape batch to [n_devices, batch_per_device, ...]
+            x = x.reshape(n_devices, batch_size // n_devices, -1)
+            y = y.reshape(n_devices, batch_size // n_devices, -1)
+
         params, opt_state, loss = train_step(params, x, y, opt_state)
 
         tokens_seen = (step + 1) * tokens_per_step
@@ -108,15 +141,28 @@ def train(config: TransformerConfig, token_budget: int, batch_size: int = 64,
         if step % eval_every == 0 or step == total_steps - 1:
             vx, vy = get_batch(val_tokens, batch_size, rng, config.block_size)
             vx, vy = jnp.array(vx), jnp.array(vy)
+
+            if multi_device:
+                vx = vx.reshape(n_devices, batch_size // n_devices, -1)
+                vy = vy.reshape(n_devices, batch_size // n_devices, -1)
+
             val_loss = eval_step(params, vx, vy)
 
-            print(f"    step {step:>6d} | train_loss {loss:.4f} | val_loss {val_loss:.4f} | tokens {tokens_seen:,}")
-            log.append({"step": step, "tokens_seen": tokens_seen, "train_loss": float(loss), "val_loss": float(val_loss)})
+            # extract scalar from pmap output
+            loss_val = float(loss[0]) if multi_device else float(loss)
+            vloss_val = float(val_loss[0]) if multi_device else float(val_loss)
+
+            print(f"    step {step:>6d} | train_loss {loss_val:.4f} | val_loss {vloss_val:.4f} | tokens {tokens_seen:,}")
+            log.append({"step": step, "tokens_seen": tokens_seen, "train_loss": loss_val, "val_loss": vloss_val})
 
         if step % checkpoint_every == 0 and step > 0:
-            save_checkpoint(model_name, step, params, opt_state, log, rng)
+            ckpt_params = _unreplicate(params) if multi_device else params
+            ckpt_opt = _unreplicate(opt_state) if multi_device else opt_state
+            save_checkpoint(model_name, step, ckpt_params, ckpt_opt, log, rng)
 
     # Final checkpoint
-    save_checkpoint(model_name, total_steps - 1, params, opt_state, log, rng)
+    ckpt_params = _unreplicate(params) if multi_device else params
+    ckpt_opt = _unreplicate(opt_state) if multi_device else opt_state
+    save_checkpoint(model_name, total_steps - 1, ckpt_params, ckpt_opt, log, rng)
 
-    return params, log 
+    return ckpt_params, log

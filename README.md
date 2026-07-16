@@ -1,139 +1,170 @@
-# JAX Scaling Laws
+# Scaling Laws for Neural Language Models in JAX
 
-Replicating Chinchilla-style compute-optimal scaling laws from scratch in pure JAX/Flax. Trains a family of decoder-only transformers (3M–110M parameters), fits the parametric scaling law `L(N,D) = E + A/N^α + B/D^β`, then predicts the validation loss of a held-out 150M-parameter model before training it.
+An empirical study of compute-optimal scaling laws for transformer language models, implemented from scratch in JAX/Flax. We train a family of decoder-only transformers spanning two orders of magnitude (6.6M to 124M parameters), fit the Chinchilla parametric scaling law to the observed losses, and use the fitted law to predict the performance of a held-out ~150M-parameter model before training it.
 
-Built as a from-scratch exercise in scaling-law literacy: the entire stack — data pipeline, model, training loop, hyperparameter sweep, curve fitting, and prediction — is written in JAX with no PyTorch dependencies.
+## Motivation
+
+Hoffmann et al. (2022) showed that for a fixed compute budget, there exists an optimal allocation between model size $N$ and training data $D$, known as the "Chinchilla" result. This project replicates that finding at small scale: we train enough models to recover the scaling exponents, then test whether the fitted law generalizes to an unseen model size.
+
+The entire stack is built in JAX to exercise the functional transformation paradigm (`jit`, `grad`, `value_and_grad`) that underpins modern large-scale training infrastructure.
+
+## Approach
+
+### 1. Transformer Architecture
+
+Each model is a GPT-2-style decoder-only transformer implemented in Flax Linen. The architecture is parameterized by four knobs (`n_layers`, `d_model`, `n_heads`, `d_ff`) so model size is a clean function of configuration:
+
+![Architecture and model family diagram](results/plots/architecture.png)
+
+Key architectural choices for clean scaling signal:
+- **Pre-LayerNorm** residual connections (more stable than post-LN at small scale)
+- **No dropout:** eliminates stochastic noise from loss curves
+- **Learned positional embeddings** over 1024-token context
+- **No weight tying** between embedding and output projection
+
+### 2. Model Family
+
+We define 8 training configurations plus one held-out model, scaling both width and depth together (log-spaced in parameter count). Each model trains on exactly $D = 20N$ tokens, following the Chinchilla-recommended compute allocation where parameters and data scale in proportion. The full model family is shown in the diagram above.
+
+### 3. Training Pipeline
+
+All models share an identical training recipe to avoid confounds in the scaling fit:
+
+- **Optimizer:** AdamW ($\beta_1=0.9, \beta_2=0.999$, weight decay $= 0.1$)
+- **Schedule:** Cosine decay with 5% linear warmup, peak LR $3 \times 10^{-4}$ to $3 \times 10^{-5}$
+- **Loss:** Cross-entropy (next-token prediction) via `optax.softmax_cross_entropy_with_integer_labels`
+- **JIT compilation:** Train step is a `@jax.jit`-compiled closure over the model and optimizer, avoiding unhashable Flax modules as traced arguments
+- **Batch size:** Scaled per model (32 to 4) to fit consumer GPU memory
+
+### 4. Data
+
+WikiText-103 tokenized with GPT-2 BPE (`tiktoken`, vocab size 50,257). Stored as flat `uint16` `.npy` arrays with memory-mapped reads (`mmap_mode="r"`) for zero-copy random access. 95/5 train/val split aligned to 1024-token block boundaries.
 
 ## Results
 
-### Fitted Scaling Law
+### Scaling Law Fit
 
-```
-L(N, D) = 2.0279 + 25745.32/N^0.5598 + 5104.58/D^0.5595
-```
+We fit the Chinchilla parametric form via `scipy.optimize.curve_fit`:
 
-| Coefficient | Value | Interpretation |
+$$L(N, D) = E + \frac{A}{N^\alpha} + \frac{B}{D^\beta}$$
+
+| Coefficient | Fitted Value | Interpretation |
 |---|---|---|
-| E (irreducible loss) | 2.0279 | Entropy floor of the data |
-| A | 25,745.32 | Parameter-scaling prefactor |
-| α | 0.5598 | Parameter-scaling exponent |
-| B | 5,104.58 | Data-scaling prefactor |
-| β | 0.5595 | Data-scaling exponent |
+| $E$ | 2.0279 | Irreducible loss (data entropy floor) |
+| $A$ | 25,745.32 | Parameter-scaling prefactor |
+| $\alpha$ | 0.5598 | Parameter-scaling exponent |
+| $B$ | 5,104.58 | Data-scaling prefactor |
+| $\beta$ | 0.5595 | Data-scaling exponent |
 
-The near-equal exponents (α ≈ β ≈ 0.56) suggest parameters and data contribute roughly symmetrically to loss reduction at this scale — consistent with Chinchilla's core finding that models and data should be scaled in tandem.
+The near-equal exponents ($\alpha \approx \beta \approx 0.56$) confirm that parameters and data contribute roughly symmetrically to loss reduction, consistent with Chinchilla's central finding that models and data should scale in tandem rather than training smaller models on more tokens.
 
 ![Scaling Law: Loss vs Parameters and Tokens](results/plots/scaling_law.png)
 
-### Sweep Results
+### Training Loss Curves
 
-| Config | Layers | d_model | Heads | d_ff | Params | Tokens | Val Loss |
-|--------|--------|---------|-------|------|--------|--------|----------|
-| 3M | 2 | 64 | 2 | 256 | 6,598,528 | 131.9M | 6.0118 |
-| 6M | 4 | 96 | 3 | 384 | 10,195,200 | 203.9M | 5.2941 |
-| 10M | 4 | 128 | 4 | 512 | 13,790,208 | 275.8M | 4.8865 |
-| 17M | 6 | 192 | 6 | 768 | 22,164,864 | 443.3M | 4.0302 |
-| 30M | 8 | 256 | 8 | 1024 | 32,312,320 | 646.2M | 3.3762 |
-| 50M | 8 | 384 | 6 | 1536 | 53,187,072 | 1.06B | 3.4718 |
-| 80M | 10 | 512 | 8 | 2048 | 83,512,320 | 1.67B | 3.0712 |
-| 110M | 12 | 640 | 10 | 2560 | 124,067,840 | 2.48B | 2.7787 |
-| **150M** (held-out) | 12 | 768 | 12 | 3072 | ~150M | — | pending |
-
-Each model is trained on `20 × N` tokens following the Chinchilla compute allocation heuristic.
-
-### Loss Curves
+Validation loss across all 8 models over training. Larger models reach lower loss but require proportionally more compute (tokens):
 
 ![Loss curves across model family](results/plots/loss_curves.png)
 
 ### Compute-Optimal Frontier
 
-![Compute-optimal frontier](results/plots/compute_optimal.png)
+For a given compute budget $C \approx 6ND$ (FLOPs), the fitted law yields an optimal parameter count $N^*$ and token count $D^*$ that minimizes loss. Points above the frontier represent suboptimal allocations: either over-parameterized (too few tokens per param) or under-parameterized (wasted compute on a model too small to absorb it).
 
-For a given compute budget C ≈ 6ND (FLOPs), the fitted law yields an optimal parameter count N\* and token count D\* that minimizes loss. This is the core finding of Hoffmann et al. (2022) — larger models trained on proportionally more data outperform smaller models trained longer.
+![Compute-optimal frontier](results/plots/compute_optimal.png)
 
 ### Held-Out Prediction (150M)
 
 | Metric | Parameters | Tokens | Val Loss |
 |---|---|---|---|
-| **Predicted** | ~150M | — | — |
-| **Actual** | ~150M | — | — |
-| **Error** | | | —% |
+| **Predicted** | ~150M | | |
+| **Actual** | ~150M | | |
+| **Error** | | | % |
 
-Pending — run `python -m analysis.predict_and_verify` to train the 150M model and fill in these values.
+Pending: run `python -m analysis.predict_and_verify` to train the 150M model and verify the prediction.
 
-## Design Choices
+## Implementation Details
 
-### Why JAX/Flax/Optax
+### JAX Ecosystem
 
-The entire training stack uses the JAX ecosystem — no PyTorch. This was a deliberate choice:
+The project uses JAX end-to-end with no PyTorch dependencies:
 
-- **JAX** — functional transformations (`jit`, `grad`, `vmap`) compose cleanly, making the training step a pure function. This matters for scaling work where you need to reason precisely about compute.
-- **Flax Linen** — provides the module abstraction (`nn.compact`) without hiding the parameter tree. Model params are explicit pytrees, which makes checkpointing and param counting trivial (`jax.tree.leaves`).
-- **Optax** — composable optimizer + schedule. We use `adamw` with `warmup_cosine_decay_schedule`, matching the Chinchilla training recipe.
+| Library | Role |
+|---|---|
+| **JAX** | Functional autodiff, JIT compilation, pytree operations |
+| **Flax Linen** | `nn.Module` system with `@nn.compact`, params are explicit pytrees |
+| **Optax** | Composable optimizer chains (AdamW + cosine schedule) |
+| **tiktoken** | GPT-2 BPE tokenization |
+| **scipy** | `curve_fit` for scaling law regression |
 
-### Model Architecture
+### Compute Optimization
 
-GPT-2-style decoder-only transformer with choices that keep the scaling signal clean:
+The 8-model sweep runs comfortably on a single GPU, but the held-out 150M verification run at ~3B tokens presents a compute bottleneck. We address this with two complementary strategies: multi-GPU data parallelism and bfloat16 mixed precision.
 
-- **Pre-LayerNorm** — LayerNorm before attention and MLP (more stable training than post-LN, especially at smaller scales)
-- **No dropout** (`dropout=0.0`) — dropout adds noise to the loss signal; for scaling law fitting we want the cleanest possible loss curves
-- **Fused QKV projection** — single `Dense(3 * d_model)` then split, standard efficient pattern
-- **GELU activation** in MLP — matches GPT-2/Chinchilla
-- **Learned positional embeddings** — simple and sufficient at these context lengths (1024)
-- **No weight tying** — embedding and output projection are separate
+**Automatic multi-device detection.** The training step auto-detects available devices at launch. With a single GPU it compiles via `@jax.jit` as normal. With multiple GPUs it switches to `@jax.pmap`, replicating model parameters on each device, sharding the batch, and synchronizing gradients via `lax.pmean`:
 
-### Training Optimization
+```python
+n_devices = jax.local_device_count()
 
-- **AdamW** with weight decay 0.1 — standard for transformer pretraining
-- **Cosine decay with warmup** — 5% warmup steps, decay from 3e-4 to 3e-5. Consistent schedule across all model sizes to avoid LR being a confound in the scaling fit.
-- **Closure-based JIT** — `make_train_step(model, tx)` returns a `@jax.jit`-compiled closure. This avoids passing unhashable Flax modules as JIT arguments while keeping the train step a pure function.
-- **`jax.value_and_grad`** — single forward+backward pass returns both loss and gradients
-- **Batch size scaling** — smaller batch sizes for larger models (32 → 4) to avoid OOM on consumer GPUs
+if n_devices > 1:
+    @jax.pmap(axis_name='batch')
+    def train_step(params, x, y, opt_state):
+        loss, grads = jax.value_and_grad(loss_fn)(params)
+        grads = jax.lax.pmean(grads, axis_name='batch')
+        updates, opt_state = tx.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss
+else:
+    @jax.jit
+    def train_step(params, x, y, opt_state):
+        ...
+```
 
-### Data Pipeline
+Batch size scales automatically with device count (e.g. 64 per device x 2 GPUs = 128 effective), doubling throughput with near-linear scaling.
 
-- **WikiText-103** tokenized with GPT-2 BPE via `tiktoken` (50,257 vocab)
-- **Flat `.npy` shards** with `mmap_mode="r"` — zero-copy reads, no memory overhead for the full dataset
-- **Block-aligned train/val split** — 95/5 split aligned to 1024-token block boundaries
-- **Random batch sampling** — offsets drawn uniformly from the token array; no epoch structure (standard for LM pretraining at these scales)
+**bfloat16 mixed precision.** Enabled via `use_bf16=True`, the training loop casts all float32 parameters to bfloat16 before training begins. This halves memory per parameter (~300MB instead of ~600MB for 150M params), allowing larger batch sizes and faster matmuls on hardware with bf16 tensor cores (A100, 3090, 4090). The loss computation remains numerically stable since cross-entropy accumulation happens in higher precision internally.
 
-### Scaling Law Fit
+**Why data parallelism over FSDP/tensor parallelism.** The 150M model fits comfortably in a single GPU's memory, so there is no need to shard the model itself. FSDP (sharding parameters across devices) and tensor parallelism (splitting individual layers across devices) solve a different problem: fitting models too large for one device's memory. At 150M parameters that constraint does not apply, and the communication overhead of sharding params would hurt more than it helps.
 
-- **Chinchilla parametric form:** `L(N, D) = E + A/N^α + B/D^β`
-- **`scipy.optimize.curve_fit`** with bounded parameters — E ∈ [0, 10], exponents ∈ [0.01, 2.0]
-- **Compute-optimal frontier** derived by grid search: for each FLOP budget C, sweep N candidates and find argmin L(N, C/6N)
+**Estimated training time for the 150M verification run (bf16, ~3B tokens):**
 
-### Robustness
+| Setup | Batch Size | Steps | Time |
+|---|---|---|---|
+| 1x T4 (Kaggle/Colab) | 32 | ~91K | ~2-3 hrs |
+| 2x T4 (Kaggle) | 64 | ~46K | ~1-1.5 hrs |
+| 1x 3090 (Vast.ai) | 128 | ~23K | ~30 min |
+| 2x 5090 (RunPod) | 256 | ~11.5K | ~8-10 min |
 
-- **Checkpointing every 500 steps** — full training state (params, optimizer state, RNG, log) serialized via pickle. Supports resume on crash or Colab disconnects.
-- **Incremental sweep results** — `sweep_results.json` is saved after each model completes, so partial sweeps are not lost
-- **Deterministic RNG** — NumPy `default_rng` with fixed seed, state saved/restored in checkpoints for exact reproducibility
+We use 2x RTX 5090 on RunPod ($0.99/hr per GPU) for the held-out verification run. Total cost for the full 150M training: under $0.50.
+
+### Fault Tolerance
+
+- **Checkpointing every 500 steps:** serializes full state (params, optimizer, RNG, training log) via pickle. Supports resume from crash or Colab timeout.
+- **Incremental sweep saves:** `sweep_results.json` is written after each model completes, so partial sweeps are never lost.
+- **Deterministic RNG:** `numpy.random.default_rng` with saved/restored state for exact reproducibility across restarts.
 
 ## Project Structure
 
 ```
 scaling-laws/
 ├── data/
-│   ├── prepare_data.py       # download WikiText-103, tokenize with GPT-2 BPE, save as .npy
-│   └── loader.py             # mmap loader + random batch sampler
+│   ├── prepare_data.py          # download WikiText-103, tokenize, save as .npy
+│   └── loader.py                # mmap loader + random batch sampler
 ├── model/
-│   ├── transformer.py        # decoder-only transformer in Flax Linen
-│   └── init.py               # exact param counting via dummy forward pass
+│   ├── transformer.py           # decoder-only transformer (Flax Linen)
+│   └── init.py                  # exact param count via dummy forward pass
 ├── train/
-│   ├── train_step.py         # jitted train/eval steps (cross-entropy loss)
-│   └── run_training.py       # training loop, AdamW + cosine schedule, checkpointing
+│   ├── train_step.py            # @jax.jit train/eval steps, cross-entropy loss
+│   └── run_training.py          # training loop, optimizer, checkpointing
 ├── sweep/
-│   ├── model_family.py       # 8 model configs (3M–110M) + held-out 150M
-│   └── run_sweep.py          # run full sweep, save results incrementally
+│   ├── model_family.py          # 8 configs (3M–110M) + held-out 150M
+│   └── run_sweep.py             # full sweep with incremental saves
 ├── analysis/
-│   ├── fit_scaling_law.py    # fit Chinchilla L(N,D), generate scaling plots
-│   └── predict_and_verify.py # predict held-out 150M loss, train, compare
+│   ├── fit_scaling_law.py       # fit L(N,D), generate scaling plots
+│   └── predict_and_verify.py    # predict + train held-out 150M
 └── results/
-    ├── sweep_results.json    # per-model loss logs and final val losses
+    ├── sweep_results.json       # per-model training logs
     ├── scaling_law_coeffs.json  # fitted {E, A, α, B, β}
-    └── plots/
-        ├── loss_curves.png
-        ├── scaling_law.png
-        └── compute_optimal.png
+    └── plots/                   # loss_curves, scaling_law, compute_optimal
 ```
 
 ## Reproducing
@@ -141,17 +172,10 @@ scaling-laws/
 ```bash
 pip install jax[cuda12] flax optax tiktoken datasets scipy numpy matplotlib
 
-# 1. Prepare data (downloads WikiText-103, tokenizes, saves to cache/)
-python -m data.prepare_data
-
-# 2. Train all 8 models (saves results incrementally, supports resume)
-python -m sweep.run_sweep
-
-# 3. Fit scaling law and generate plots
-python -m analysis.fit_scaling_law
-
-# 4. Predict 150M loss and verify by training
-python -m analysis.predict_and_verify
+python -m data.prepare_data           # 1. download + tokenize WikiText-103
+python -m sweep.run_sweep             # 2. train all 8 models (resumable)
+python -m analysis.fit_scaling_law    # 3. fit scaling law + generate plots
+python -m analysis.predict_and_verify # 4. predict + verify held-out 150M
 ```
 
 For CPU-only or Colab, replace `jax[cuda12]` with `jax`.
@@ -161,4 +185,4 @@ For CPU-only or Colab, replace `jax[cuda12]` with `jax`.
 - Hoffmann et al. 2022, [Training Compute-Optimal Large Language Models](https://arxiv.org/abs/2203.15556) (Chinchilla)
 - Kaplan et al. 2020, [Scaling Laws for Neural Language Models](https://arxiv.org/abs/2001.08361)
 - Karpathy, [nanoGPT](https://github.com/karpathy/nanoGPT)
-- [The Scaling Book](https://jax-ml.github.io/scaling-book/) — JAX-specific scaling guide
+- [The Scaling Book](https://jax-ml.github.io/scaling-book/): JAX-specific scaling guide

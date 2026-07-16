@@ -17,13 +17,19 @@ def chinchilla_law(X, E, A, alpha, B, beta):
     return E + A / (N ** alpha) + B / (D ** beta)
 
 
+def _param_label(n_params):
+    """Format param count as a readable label (e.g. 6.6M)."""
+    return f"{n_params / 1e6:.1f}M"
+
+
 def plot_loss_curves(results):
     """Plot training loss curves for all models."""
     fig, ax = plt.subplots(figsize=(10, 6))
     for name, data in results.items():
         steps = [entry["step"] for entry in data["log"]]
         val_losses = [entry["val_loss"] for entry in data["log"]]
-        ax.plot(steps, val_losses, label=f'{name} ({data["n_params"]:,} params)')
+        label = _param_label(data["n_params"])
+        ax.plot(steps, val_losses, label=label)
     ax.set_xlabel("Step")
     ax.set_ylabel("Validation Loss")
     ax.set_title("Loss Curves Across Model Family")
@@ -107,10 +113,13 @@ def fit_scaling_law():
     with open(RESULT_DIR / "sweep_results.json") as f:
         results = json.load(f)
 
-    names = list(results.keys())
-    N = np.array([results[n]["n_params"] for n in names], dtype=np.float64)
-    D = np.array([results[n]["tokens"] for n in names], dtype=np.float64)
-    L = np.array([results[n]["final_val_loss"] for n in names], dtype=np.float64)
+    config_names = list(results.keys())
+    N = np.array([results[n]["n_params"] for n in config_names], dtype=np.float64)
+    D = np.array([results[n]["tokens"] for n in config_names], dtype=np.float64)
+    L = np.array([results[n]["final_val_loss"] for n in config_names], dtype=np.float64)
+
+    # Use true param counts as display labels
+    labels = [_param_label(results[n]["n_params"]) for n in config_names]
 
     # Fit
     p0 = [2.0, 100.0, 0.4, 100.0, 0.4]
@@ -129,7 +138,7 @@ def fit_scaling_law():
     # Generate plots
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
     plot_loss_curves(results)
-    plot_scaling_law(N, D, L, names, coeffs)
+    plot_scaling_law(N, D, L, labels, coeffs)
     plot_compute_optimal(N, D, L, coeffs)
 
     return coeffs
