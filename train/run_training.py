@@ -9,7 +9,7 @@ from pathlib import Path
 from model.transformer import Transformer, TransformerConfig
 from model.init import count_params
 from data.loader import load_shard, get_batch
-from train.train_step import make_train_step, make_eval_step
+from train.train_step import make_train_step, make_eval_step, make_grad_step, make_update_step
 
 
 CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "results" / "checkpoints"
@@ -69,19 +69,26 @@ def _unreplicate(tree):
 
 def train(config: TransformerConfig, token_budget: int, batch_size: int = 64,
           eval_every: int = 100, checkpoint_every: int = 500,
-          seed: int = 42, model_name: str = "model", use_bf16: bool = False):
-    """Train a single model with checkpointing, resume, and auto multi-GPU support."""
+          seed: int = 42, model_name: str = "model", use_bf16: bool = False,
+          grad_accum_steps: int = 1):
+    """Train a single model with checkpointing, resume, and auto multi-GPU support.
+
+    grad_accum_steps: number of microbatches to accumulate before updating.
+    Effective batch = batch_size * grad_accum_steps (per device if multi-GPU).
+    """
     n_devices = jax.local_device_count()
     multi_device = n_devices > 1
 
+    effective_batch = batch_size * grad_accum_steps
     if multi_device:
-        # use per-device batch size as-is, total = batch_size * n_devices
-        batch_size = batch_size * n_devices
-        print(f"Multi-GPU: {n_devices} devices detected, effective batch size = {batch_size}")
+        effective_batch = effective_batch * n_devices
+        print(f"Multi-GPU: {n_devices} devices detected")
+
+    print(f"Micro-batch: {batch_size}, grad accum: {grad_accum_steps}, effective batch: {effective_batch}")
 
     model = Transformer(config)
 
-    tokens_per_step = batch_size * config.block_size
+    tokens_per_step = effective_batch * config.block_size
     total_steps = token_budget // tokens_per_step
 
     tx = create_optimizer(config, total_steps)
@@ -112,57 +119,87 @@ def train(config: TransformerConfig, token_budget: int, batch_size: int = 64,
     train_tokens = load_shard("train")
     val_tokens = load_shard("val")
 
-    train_step = make_train_step(model, tx)
-    eval_step = make_eval_step(model)
-
-    # replicate params and optimizer state across devices for pmap
-    if multi_device:
-        params = _replicate(params)
-        opt_state = _replicate(opt_state)
-
     n_params = count_params(config)
     print(f"Training {n_params:,} param model for {total_steps:,} steps ({token_budget:,} tokens)")
     if start_step > 0:
         print(f"  Starting from step {start_step}")
 
-    for step in range(start_step, total_steps):
-        x, y = get_batch(train_tokens, batch_size, rng, config.block_size)
-        x, y = jnp.array(x), jnp.array(y)
+    if multi_device and grad_accum_steps == 1:
+        # standard pmap path (no gradient accumulation)
+        train_step = make_train_step(model, tx)
+        eval_step = make_eval_step(model)
+        params = _replicate(params)
+        opt_state = _replicate(opt_state)
 
-        if multi_device:
-            # reshape batch to [n_devices, batch_per_device, ...]
-            x = x.reshape(n_devices, batch_size // n_devices, -1)
-            y = y.reshape(n_devices, batch_size // n_devices, -1)
+        for step in range(start_step, total_steps):
+            x, y = get_batch(train_tokens, effective_batch, rng, config.block_size)
+            x, y = jnp.array(x), jnp.array(y)
+            x = x.reshape(n_devices, batch_size, -1)
+            y = y.reshape(n_devices, batch_size, -1)
 
-        params, opt_state, loss = train_step(params, x, y, opt_state)
+            params, opt_state, loss = train_step(params, x, y, opt_state)
+            tokens_seen = (step + 1) * tokens_per_step
 
-        tokens_seen = (step + 1) * tokens_per_step
+            if step % eval_every == 0 or step == total_steps - 1:
+                vx, vy = get_batch(val_tokens, effective_batch, rng, config.block_size)
+                vx, vy = jnp.array(vx), jnp.array(vy)
+                vx = vx.reshape(n_devices, batch_size, -1)
+                vy = vy.reshape(n_devices, batch_size, -1)
+                val_loss = eval_step(params, vx, vy)
+                loss_val = float(loss[0])
+                vloss_val = float(val_loss[0])
+                print(f"    step {step:>6d} | train_loss {loss_val:.4f} | val_loss {vloss_val:.4f} | tokens {tokens_seen:,}")
+                log.append({"step": step, "tokens_seen": tokens_seen, "train_loss": loss_val, "val_loss": vloss_val})
 
-        if step % eval_every == 0 or step == total_steps - 1:
-            vx, vy = get_batch(val_tokens, batch_size, rng, config.block_size)
-            vx, vy = jnp.array(vx), jnp.array(vy)
+            if step % checkpoint_every == 0 and step > 0:
+                save_checkpoint(model_name, step, _unreplicate(params), _unreplicate(opt_state), log, rng)
 
-            if multi_device:
-                vx = vx.reshape(n_devices, batch_size // n_devices, -1)
-                vy = vy.reshape(n_devices, batch_size // n_devices, -1)
+        final_params = _unreplicate(params)
+        final_opt = _unreplicate(opt_state)
 
-            val_loss = eval_step(params, vx, vy)
+    else:
+        # gradient accumulation path (works with single or multi-GPU)
+        grad_step = make_grad_step(model)
+        update_step = make_update_step(tx)
+        eval_step_fn = make_eval_step(model)
 
-            # extract scalar from pmap output
-            loss_val = float(loss[0]) if multi_device else float(loss)
-            vloss_val = float(val_loss[0]) if multi_device else float(val_loss)
+        for step in range(start_step, total_steps):
+            # accumulate gradients over microbatches
+            acc_grads = None
+            acc_loss = 0.0
 
-            print(f"    step {step:>6d} | train_loss {loss_val:.4f} | val_loss {vloss_val:.4f} | tokens {tokens_seen:,}")
-            log.append({"step": step, "tokens_seen": tokens_seen, "train_loss": loss_val, "val_loss": vloss_val})
+            for _ in range(grad_accum_steps):
+                x, y = get_batch(train_tokens, batch_size, rng, config.block_size)
+                x, y = jnp.array(x), jnp.array(y)
+                loss, grads = grad_step(params, x, y)
 
-        if step % checkpoint_every == 0 and step > 0:
-            ckpt_params = _unreplicate(params) if multi_device else params
-            ckpt_opt = _unreplicate(opt_state) if multi_device else opt_state
-            save_checkpoint(model_name, step, ckpt_params, ckpt_opt, log, rng)
+                if acc_grads is None:
+                    acc_grads = grads
+                else:
+                    acc_grads = jax.tree.map(lambda a, g: a + g, acc_grads, grads)
+                acc_loss += float(loss)
+
+            # average gradients
+            acc_grads = jax.tree.map(lambda g: g / grad_accum_steps, acc_grads)
+            acc_loss /= grad_accum_steps
+
+            params, opt_state = update_step(params, acc_grads, opt_state)
+            tokens_seen = (step + 1) * tokens_per_step
+
+            if step % eval_every == 0 or step == total_steps - 1:
+                vx, vy = get_batch(val_tokens, batch_size, rng, config.block_size)
+                vx, vy = jnp.array(vx), jnp.array(vy)
+                val_loss = float(eval_step_fn(params, vx, vy))
+                print(f"    step {step:>6d} | train_loss {acc_loss:.4f} | val_loss {val_loss:.4f} | tokens {tokens_seen:,}")
+                log.append({"step": step, "tokens_seen": tokens_seen, "train_loss": acc_loss, "val_loss": val_loss})
+
+            if step % checkpoint_every == 0 and step > 0:
+                save_checkpoint(model_name, step, params, opt_state, log, rng)
+
+        final_params = params
+        final_opt = opt_state
 
     # Final checkpoint
-    ckpt_params = _unreplicate(params) if multi_device else params
-    ckpt_opt = _unreplicate(opt_state) if multi_device else opt_state
-    save_checkpoint(model_name, total_steps - 1, ckpt_params, ckpt_opt, log, rng)
+    save_checkpoint(model_name, total_steps - 1, final_params, final_opt, log, rng)
 
-    return ckpt_params, log
+    return final_params, log

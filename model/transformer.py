@@ -62,6 +62,7 @@ class TransformerBlock(nn.Module):
     config: TransformerConfig
 
     @nn.compact
+    @nn.remat  # gradient checkpointing: recompute activations during backward instead of storing
     def __call__(self, x, deterministic=True):
         # pre ln architecture
         x = x + CasualSelfAttention(self.config)(nn.LayerNorm()(x), deterministic)
