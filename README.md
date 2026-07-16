@@ -76,11 +76,11 @@ For a given compute budget $C \approx 6ND$ (FLOPs), the fitted law yields an opt
 
 | Metric | Parameters | Tokens | Val Loss |
 |---|---|---|---|
-| **Predicted** | ~150M | | |
-| **Actual** | ~150M | | |
-| **Error** | | | % |
+| **Predicted** | 163M | 3.26B | 2.7025 |
+| **Actual** | 163M | 3.26B | 3.3125 |
+| **Error** | | | 18.4% |
 
-Pending: run `python -m analysis.predict_and_verify` to train the 150M model and verify the prediction.
+The fitted scaling law predicted a validation loss of 2.70 for the held-out 150M model. The actual loss after training on 3.26B tokens was 3.31, an 18.4% overestimate of model performance. The gap likely reflects a combination of factors: the smaller models in the sweep were trained on WikiText-103 which has limited diversity compared to larger pretraining corpora, and the scaling law was fit on only 8 data points spanning a relatively narrow parameter range. At this scale, small systematic biases in the fit (e.g. slightly optimistic irreducible loss $E$) compound when extrapolating to the held-out model size.
 
 ## Implementation Details
 
