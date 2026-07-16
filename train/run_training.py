@@ -75,8 +75,8 @@ def train(config: TransformerConfig, token_budget: int, batch_size: int = 64,
     multi_device = n_devices > 1
 
     if multi_device:
-        # scale batch size by device count for higher throughput
-        batch_size = max(batch_size, 32) * n_devices
+        # use per-device batch size as-is, total = batch_size * n_devices
+        batch_size = batch_size * n_devices
         print(f"Multi-GPU: {n_devices} devices detected, effective batch size = {batch_size}")
 
     model = Transformer(config)
