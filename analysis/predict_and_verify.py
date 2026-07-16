@@ -29,7 +29,7 @@ def predict_and_verify(tokens_per_param: int = 20):
 
     # train and verify loss 
     print(f"\nTraining 150M model to verify...")
-    params, log = train(cfg, token_budget, batch_size=16, use_bf16=True)
+    params, log = train(cfg, token_budget, batch_size=32, use_bf16=True)
     actual_loss = log[-1]["val_loss"]
 
     pct_error = abs(predicted_loss - actual_loss) / actual_loss * 100
