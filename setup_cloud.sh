@@ -7,7 +7,15 @@ set -e
 echo "=== Scaling Laws: Cloud Setup ==="
 
 # install JAX with CUDA support + project deps
-pip install -q "jax[cuda12]" flax optax tiktoken datasets scipy numpy matplotlib
+pip install -q "jax[cuda12]" flax optax tiktoken datasets scipy numpy matplotlib huggingface_hub
+
+# authenticate with HuggingFace for faster downloads
+if [ -n "$HF_TOKEN" ]; then
+    huggingface-cli login --token "$HF_TOKEN" 2>/dev/null
+    echo "HuggingFace authenticated"
+else
+    echo "No HF_TOKEN set (downloads will be slower). Set with: export HF_TOKEN=<token>"
+fi
 
 # verify GPU setup
 python -c "

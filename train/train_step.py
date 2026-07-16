@@ -22,8 +22,7 @@ def make_train_step(model, tx):
     n_devices = _num_devices()
 
     if n_devices > 1:
-        @jax.pmap(axis_name='batch')
-        def train_step(params, x, y, opt_state):
+        def _train_step(params, x, y, opt_state):
             def loss_fn(params):
                 logits = model.apply(params, x)
                 return cross_entropy_loss(logits, y)
@@ -34,6 +33,8 @@ def make_train_step(model, tx):
             updates, opt_state_new = tx.update(grads, opt_state, params)
             params = optax.apply_updates(params, updates)
             return params, opt_state_new, loss
+
+        train_step = jax.pmap(_train_step, axis_name='batch')
     else:
         @jax.jit
         def train_step(params, x, y, opt_state):
@@ -54,11 +55,12 @@ def make_eval_step(model):
     n_devices = _num_devices()
 
     if n_devices > 1:
-        @jax.pmap(axis_name='batch')
-        def eval_step(params, x, y):
+        def _eval_step(params, x, y):
             logits = model.apply(params, x)
             loss = cross_entropy_loss(logits, y)
             return jax.lax.pmean(loss, axis_name='batch')
+
+        eval_step = jax.pmap(_eval_step, axis_name='batch')
     else:
         @jax.jit
         def eval_step(params, x, y):
